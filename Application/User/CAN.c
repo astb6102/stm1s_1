@@ -1,0 +1,496 @@
+#include "main.h"
+
+#include "CAN.h"
+
+#include <stdlib.h>
+
+#include "PID_controller.h"
+
+#include <string.h>
+
+#include "stm32f4xx_hal.h"
+
+#include "FLASH_MEMORY.h"
+
+
+
+ECOMAC ECOMAC_Rx;
+
+ECOMAC_DATA ECOMAC_Tx;
+
+
+
+#define CAN_RECEIVE_ID  0x18FF02EF
+
+#define CAN_TRANSMIT_ID  0x18FF01D1
+
+#define POSITION_TOLERANCE 1.0f
+
+#define SHIFT_OPSTS_NOT_RUNNING  0
+
+#define SHIFT_OPSTS_RUNNING      1
+
+#define SHIFT_OPSTS_COMPLETED    2
+
+int VER=11;
+
+
+
+
+
+uint8_t falut1;
+
+
+
+
+
+float Prev_Command = -1000.0f;  // 초기화는 불가능한 값으로
+
+
+
+uint32_t Completed_Start_Time = 0;
+uint32_t RunningTime = 0;
+
+
+CAN_FilterTypeDef CAN2_FILTER;
+
+CAN_RxHeaderTypeDef CAN2_RxHeader;
+
+CAN_TxHeaderTypeDef CAN2_TxHeader;
+
+uint8_t CAN2_Rx0Data[8];
+
+uint32_t TxMailBox;
+
+uint8_t CAN2_Tx0Data[8];
+
+volatile uint8_t CAN2_Rx_Flag=0;
+
+uint8_t System_Reset=0;
+
+uint8_t ResponseMode;
+
+uint8_t Current_Stage_Number = 1;
+
+uint8_t TCU_ShiftOpSts;
+
+uint8_t TCU_StgNum;
+
+uint8_t TCUFltFlag,cmd_n;
+
+extern int Position_control,operation;
+uint8_t error=0;run_flag=0;
+uint32_t running;
+
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+
+{
+
+if(hcan->Instance == CAN2)
+
+{
+
+CAN2_Rx_Flag=1;
+
+HAL_CAN_GetRxMessage(&hcan2, CAN_RX_FIFO0, &CAN2_RxHeader, &CAN2_Rx0Data[0]);
+
+}
+
+}
+
+
+
+void CAN_SET()
+
+{
+
+CAN2_FILTER.FilterMode = CAN_FILTERMODE_IDMASK;
+
+CAN2_FILTER.FilterScale = CAN_FILTERSCALE_32BIT;
+
+CAN2_FILTER.FilterIdHigh = (CAN_RECEIVE_ID >> 13) & 0xFFFF;//x159<<5;
+
+CAN2_FILTER.FilterIdLow  = ((CAN_RECEIVE_ID << 3) & 0xFFFF) | (1 << 2);
+
+CAN2_FILTER.FilterMaskIdHigh=0xFFFF;//(0x18FF02EF<<3)>>16;
+
+CAN2_FILTER.FilterMaskIdLow =0xFFFF;//((0x18FF02EF<<3)&0xFFFF)|(0x1<<2);
+
+CAN2_FILTER.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+
+CAN2_FILTER.FilterBank = 0;
+
+CAN2_FILTER.FilterActivation= ENABLE;
+
+HAL_CAN_ConfigFilter(&hcan2, &CAN2_FILTER);
+
+HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+CAN2_TxHeader.ExtId = CAN_TRANSMIT_ID;
+
+CAN2_TxHeader.RTR = CAN_RTR_DATA;
+
+CAN2_TxHeader.IDE = CAN_ID_EXT;
+
+CAN2_TxHeader.DLC = 8;
+
+}
+
+
+
+void parse_CAN_Data(uint8_t* CAN_Rx_DATA)
+
+{
+
+    ECOMAC_Rx.VCU_RDY           = (CAN_Rx_DATA[0] >> 7) & 0x01; /// controller ready로 변경
+
+    ECOMAC_Rx.VCU_ShiftCMD      = (CAN_Rx_DATA[0]) & 0X0F;//0x03;(CAN_Rx_DATA[0] >> 2) & 0X0F;
+    //성산 vcc
+    /*if(ECOMAC_Rx.VCU_ShiftCMD==0)
+    {
+    	Current_Stage_Number = 1;
+    	TCU_ShiftOpSts = SHIFT_OPSTS_COMPLETED;
+    }
+    if(ECOMAC_Rx.VCU_ShiftCMD==1)
+    {
+        	Current_Stage_Number = 0;
+        	TCU_ShiftOpSts = SHIFT_OPSTS_COMPLETED;
+
+    }
+    if(ECOMAC_Rx.VCU_ShiftCMD==2)
+
+    {
+           	Current_Stage_Number = 2;
+           	TCU_ShiftOpSts = SHIFT_OPSTS_COMPLETED;
+
+    } */
+
+    //성산 vcc
+    ECOMAC_Rx.VCU_SIGN_POSITION =  CAN_Rx_DATA[1];
+
+    uint16_t raw_position       = ((uint16_t) CAN_Rx_DATA[2] << 8) | CAN_Rx_DATA[3];
+
+
+
+    if (ECOMAC_Rx.VCU_SIGN_POSITION == 0xFF)
+
+        ECOMAC_Rx.VCU_POSITION  = -(int16_t)raw_position;
+
+     else
+
+    ECOMAC_Rx.VCU_POSITION  =  (int16_t)raw_position;
+
+
+
+    ECOMAC_Rx.CAN_EPT_Neutral   =  CAN_Rx_DATA[5];
+
+    ECOMAC_Rx.CAN_EPT_STAGE2    =  CAN_Rx_DATA[6];
+
+    ECOMAC_Rx.EPT_SET           = (CAN_Rx_DATA[7] >> 7) & 0x01;
+
+    ECOMAC_Rx.VCU_ZERO_SET      =  CAN_Rx_DATA[7] & 0x01;
+
+}
+
+
+
+void Update_Control_Variable()
+
+{
+
+EPT_SETTING=ECOMAC_Rx.EPT_SET;
+
+
+
+
+
+if(EPT_SETTING==1)
+
+{
+
+EPT_Neutral=ECOMAC_Rx.CAN_EPT_Neutral;
+
+EPT_STAGE2 =ECOMAC_Rx.CAN_EPT_STAGE2;
+
+}
+
+ZERO_SETTING=ECOMAC_Rx.VCU_ZERO_SET;
+
+
+
+
+
+if(ECOMAC_Rx.VCU_RDY==1)
+
+{
+if(error==0)
+{
+Position_control=2;
+
+operation=1;
+}
+else
+{
+	//operation=0;
+	}
+}
+
+else
+
+{
+
+Position_control=0;
+
+operation=0;
+
+}
+
+if(ECOMAC_Rx.VCU_RDY==1)
+
+{
+
+if(error==0)
+{
+switch (ECOMAC_Rx.VCU_ShiftCMD) //성산
+
+{
+
+    case 0:
+
+        Position_PID.CMD = 0;
+
+        break;
+    case 1:
+
+        //Position_PID.CMD = 0;
+
+        break;
+
+    case 4:
+
+        Position_PID.CMD =(float)EPT_Neutral*0.1;
+
+        break;
+
+    case 8:
+
+        Position_PID.CMD =(float)EPT_STAGE2*0.1;
+
+        break;
+
+    case 12:
+
+        Position_PID.CMD = ECOMAC_Rx.VCU_POSITION*0.1;
+
+        break;
+
+    default:
+
+    	 //Position_PID.CMD =(float)EPT_Neutral*0.1;
+
+        break;
+
+}
+}
+
+if(error==1)
+	 Position_PID.CMD =(float)EPT_Neutral*0.1;
+
+}
+
+}
+
+void Check_Position_Command_Completion() // 실제 위치를 단수로 변경
+
+{
+
+
+	float diff = fabsf(CURRENT_POSITION - Position_PID.CMD);
+
+
+
+  //if (diff <= POSITION_TOLERANCE)
+
+  //{
+
+        if (CURRENT_POSITION <= 1 || CURRENT_POSITION >= 358.0f)
+
+        {
+
+            Current_Stage_Number = 1;
+
+        }
+
+        else if (CURRENT_POSITION <= (EPT_Neutral*0.1)+1 && CURRENT_POSITION >= (EPT_Neutral*0.1)-1)
+
+        {
+
+        	 Current_Stage_Number = 0;
+
+        }
+
+        else if (CURRENT_POSITION <= (EPT_STAGE2*0.1)+2 && CURRENT_POSITION >= (EPT_STAGE2*0.1)-1)
+
+        {
+
+            Current_Stage_Number = 2; // Stage2
+
+        }
+        else
+        {
+        	 Current_Stage_Number = 0;
+        }
+
+  //}
+
+TCU_StgNum=Current_Stage_Number;
+
+
+    // 도달하지 않았으면 Current_Stage_Number 값 유지 (변화 없음)
+
+}
+
+
+
+
+
+
+void Update_TCU_ShiftOpSts()
+
+{
+
+    uint32_t now = HAL_GetTick();
+    running=HAL_GetTick();
+
+
+    if (Position_PID.CMD != Prev_Command)
+
+    {
+
+        TCU_ShiftOpSts = SHIFT_OPSTS_RUNNING; // 임시주석 성산
+
+        Completed_Start_Time = 0;
+        if(run_flag==0)
+        {
+        	RunningTime=running;
+        	run_flag=1;
+        }
+        Prev_Command = Position_PID.CMD;
+
+
+    }
+
+
+
+    if ((fabsf(CURRENT_POSITION - Position_PID.CMD) <= POSITION_TOLERANCE) &&(TCU_ShiftOpSts == SHIFT_OPSTS_RUNNING))
+
+    {
+
+        TCU_ShiftOpSts = SHIFT_OPSTS_COMPLETED;
+
+        Completed_Start_Time = now;
+        run_flag=0;
+        CAN2_Rx_Flag=1;
+
+    }
+    else if((fabsf(CURRENT_POSITION - Position_PID.CMD) >= (360-POSITION_TOLERANCE)) &&(TCU_ShiftOpSts == SHIFT_OPSTS_RUNNING))
+    {
+        TCU_ShiftOpSts = SHIFT_OPSTS_COMPLETED;
+
+            Completed_Start_Time = now;
+            run_flag=0;
+            CAN2_Rx_Flag=1;
+    }
+
+    if(Position_PID.CMD >= (EPT_Neutral*0.1) && Position_PID.CMD <= ((EPT_Neutral*0.1)+0.1))
+    	 cmd_n=1;
+     else
+    	 cmd_n=0;
+    if(running-RunningTime>=40000  && run_flag==1) //&&running-RunningTime<=42000
+       	error=1;
+
+    if(running-RunningTime>=42000 && cmd_n==1 && error==1)
+    {
+    	//operation=0;
+    	TCU_ShiftOpSts = SHIFT_OPSTS_NOT_RUNNING;
+    	error=1;
+    	run_flag=0; // 추가 수정
+
+    }
+    if(CURRENT_POSITION>=(EPT_Neutral*0.1)-1 && CURRENT_POSITION<=(EPT_Neutral*0.1)+1)
+          	error=0;
+
+    if ((TCU_ShiftOpSts == SHIFT_OPSTS_COMPLETED) && ((now - Completed_Start_Time) >= 2000))
+
+    {
+
+        TCU_ShiftOpSts = SHIFT_OPSTS_NOT_RUNNING;
+        run_flag=0;
+        RunningTime=0;
+        error=0;
+    }
+
+}
+
+
+
+void ECOMAC_Tx_Data_Build()
+
+{
+
+Check_Position_Command_Completion();
+
+Update_TCU_ShiftOpSts();
+if(error==1)
+ ECOMAC_Tx.TCU_Fault_Code=(ECOMAC_Tx.TCU_Fault_Code |= 0x80);
+else
+	 ECOMAC_Tx.TCU_Fault_Code=ECOMAC_Tx.TCU_Fault_Code;
+
+    if(ECOMAC_Tx.TCU_Fault_Code !=0 )
+
+    TCUFltFlag=1;
+
+    else
+
+    {
+
+    TCUFltFlag=0;
+
+    }
+
+
+
+ECOMAC_Tx.TCU_DATA  = ((TCU_ShiftOpSts & 0x03) << 6) |
+
+                      ((TCU_StgNum     & 0x03) << 4) |
+
+                      ((TCUFltFlag     & 0x01) << 3);
+
+
+
+CAN2_Tx0Data[0] =  ECOMAC_Tx.TCU_DATA;
+
+CAN2_Tx0Data[1] =  ECOMAC_Tx.TCU_Oil_Temp;
+
+CAN2_Tx0Data[2] =  VER;
+
+CAN2_Tx0Data[3] =  0;
+
+CAN2_Tx0Data[4] =  ECOMAC_Tx.TCU_Fault_Code;
+
+CAN2_Tx0Data[5] =  ECOMAC_Tx.TCU_SIGN_POSITION;
+
+CAN2_Tx0Data[6] =  ECOMAC_Tx.TCU_POSITION_HIGH;
+
+CAN2_Tx0Data[7] =  ECOMAC_Tx.TCU_POSITION_LOW;
+
+
+
+}
+
+
+
+
+
+
